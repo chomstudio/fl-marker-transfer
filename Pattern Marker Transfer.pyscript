@@ -1,0 +1,251 @@
+"""通常パターンマーカーを1欄のJSONでコピー・編集・置換する。"""
+
+import json
+import uuid
+
+import flpianoroll as flp
+
+SCRIPT_NAME = "Pattern Marker Transfer"
+VERSION = "0.2.3"
+_RUN_ID = uuid.uuid4().hex[:8]
+DATA = "マーカー情報 [" + _RUN_ID + "]"
+OFFSET = "貼り付けオフセット（小節） [" + _RUN_ID + "]"
+OFFSET_LIMIT = 16
+MAX_TIME = 2147483647
+FIELDS = ("time", "name", "mode", "tsnum", "tsden", "scale_root", "scale_helper")
+
+
+def _log(message):
+    """プレビュー中にモーダル警告を開かず、結果を記録する。"""
+    flp.Utils.log("[PMT] " + message)
+
+
+def _snapshot():
+    """APIオブジェクトを保持せず、公開マーカープロパティを値として退避する。"""
+    count = flp.score.markerCount
+    result = []
+    for index in range(count):
+        marker = flp.score.getMarker(index)
+        result.append({key: getattr(marker, key) for key in FIELDS})
+    return result
+
+
+def _normal(markers):
+    """通常マーカーの転送対象プロパティを抽出する。"""
+    return [{"time": m["time"], "name": m["name"]} for m in markers if m["mode"] == 0]
+
+
+def _others(markers):
+    """種別の値を限定せず、対象外マーカーを抽出する。"""
+    return [m for m in markers if m["mode"] != 0]
+
+
+def _signature(rows):
+    """列挙順に依存せず、重複件数と各プロパティを比較する。"""
+    return sorted(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows)
+
+
+def _encode(rows, ppq):
+    """同時刻の取得順とラベルを保持し、正式形式の1行JSONを生成する。"""
+    return json.dumps(
+        {
+            "format": "PMT-1",
+            "ppq": ppq,
+            "mode": 0,
+            "markers": sorted(rows, key=lambda row: row["time"]),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _unique_object(pairs):
+    """JSON標準デコーダーが上書きしてしまう重複キーを拒否する。"""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"キーが重複しています: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value):
+    """JSON規格外のNaNとInfinityを拒否する。"""
+    raise ValueError(f"JSONで使用できない値です: {value}")
+
+
+def _check_keys(value, expected, location):
+    """必須キーの欠落と定義外のキーを両方拒否する。"""
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise ValueError(f"{location}のキーは{', '.join(expected)}だけが必要です。")
+
+
+def _decode(text, ppq):
+    """転送データを全件検査する。位置変換やホスト操作はここでは行わない。"""
+    data = json.loads(
+        text, object_pairs_hook=_unique_object, parse_constant=_reject_constant
+    )
+    _check_keys(data, ("format", "ppq", "mode", "markers"), "転送データ")
+    if data["format"] not in ("PMT-1", "PMT-preflight-1"):
+        raise ValueError("対応していない転送形式です。")
+    if type(data["ppq"]) is not int or data["ppq"] <= 0 or data["ppq"] != ppq:
+        raise ValueError(f"PPQは現在のパターンと同じ正の整数({ppq})が必要です。")
+    if type(data["mode"]) is not int or data["mode"] != 0:
+        raise ValueError("modeは整数の0が必要です。")
+    if not isinstance(data["markers"], list):
+        raise TypeError("markersは配列が必要です。")
+    rows = []
+    for index, row in enumerate(data["markers"], 1):
+        _check_keys(row, ("time", "name"), f"マーカー{index}")
+        if type(row["time"]) is not int or not 0 <= row["time"] <= MAX_TIME:
+            raise ValueError(f"マーカー{index}のtimeは0〜{MAX_TIME}の整数が必要です。")
+        if not isinstance(row["name"], str) or "\x00" in row["name"]:
+            raise ValueError(f"マーカー{index}のnameはNULを含まない文字列が必要です。")
+        rows.append({"time": row["time"], "name": row["name"]})
+    return rows
+
+
+def _bar_ticks(ppq, numerator, denominator):
+    """貼り付け先の基本拍子から1小節の長さを求め、丸めによる位置ずれを防ぐ。"""
+    if any(
+        type(value) is not int or value <= 0 for value in (ppq, numerator, denominator)
+    ):
+        raise ValueError("PPQと基本拍子は正の整数が必要です。")
+    ticks, remainder = divmod(ppq * 4 * numerator, denominator)
+    if remainder or ticks <= 0:
+        raise ValueError("この基本拍子の1小節を整数tickで表現できません。")
+    return ticks
+
+
+def _plan_placement(rows, offset_ticks=0):
+    """元データを変更せず移動し、先頭より前へ出るマーカーを切り落とす。"""
+    if type(offset_ticks) is not int:
+        raise ValueError("オフセットは整数tickが必要です。")
+    result = []
+    for row in rows:
+        time = row["time"] + offset_ticks
+        if time < 0:
+            continue
+        if time > MAX_TIME:
+            raise ValueError("配置後の位置が有効範囲外です。")
+        result.append({"time": time, "name": row["name"]})
+    return sorted(result, key=lambda row: row["time"])
+
+
+def _read_offset(form):
+    """ノブと付属の数値欄を共通の整数小節範囲で検査する。"""
+    offset = form.getInputValue(OFFSET)
+    if type(offset) is not int or not -OFFSET_LIMIT <= offset <= OFFSET_LIMIT:
+        raise ValueError("オフセットは-16〜+16の整数小節が必要です。")
+    return offset
+
+
+def _replace(rows, protected):
+    """準備・衝突検査後に通常マーカーだけを置換し、読み戻しで照合する。"""
+    before = _snapshot()
+    if _signature(_others(before)) != _signature(protected):
+        raise RuntimeError("対象外マーカーが起動時と異なります。操作を中止します。")
+    if _signature(_normal(before)) == _signature(rows):
+        return
+
+    # 対象外マーカーを上書きする可能性がある組み合わせは、削除前に拒否する。
+    protected_times = {m["time"] for m in protected}
+    if any(row["time"] in protected_times for row in _normal(before)):
+        raise ValueError(
+            "通常マーカーと対象外マーカーが同じ位置にあるため、安全に復元できません。"
+        )
+    if any(row["time"] in protected_times for row in rows):
+        raise ValueError("対象外マーカーと同じ位置への追加には対応していません。")
+    pending = []
+    for row in rows:
+        marker = flp.Marker()
+        marker.mode = 0
+        marker.time = row["time"]
+        marker.name = row["name"]
+        pending.append(marker)
+    for index in range(len(before) - 1, -1, -1):
+        if before[index]["mode"] == 0:
+            flp.score.deleteMarker(index)
+    for marker in pending:
+        flp.score.addMarker(marker)
+    after = _snapshot()
+    if _signature(_others(after)) != _signature(protected):
+        raise RuntimeError("対象外マーカーの保持検査に失敗しました。")
+    if _signature(_normal(after)) != _signature(rows):
+        raise RuntimeError("通常マーカーの名前・位置・件数が一致しません。")
+
+
+def _restore():
+    """直前のプレビューによらず、起動時の通常マーカーへの復元を試みる。"""
+    try:
+        _replace(_INITIAL_ROWS, _PROTECTED)
+        _log("起動時の通常マーカーを確認・復元しました。")
+    except Exception as error:  # noqa: BLE001 - 復元失敗を成功扱いしない
+        _log("[復元失敗] " + repr(error))
+        _log("確定せずキャンセルし、起動時の状態へ戻ったか確認してください。")
+
+
+_READY = False
+try:
+    _PPQ = flp.score.PPQ
+    if type(_PPQ) is not int or _PPQ <= 0:
+        raise ValueError("現在のPPQを取得できません。")
+    _TSNUM = flp.score.tsnum
+    _TSDEN = flp.score.tsden
+    _BAR_TICKS = _bar_ticks(_PPQ, _TSNUM, _TSDEN)
+    _INITIAL = _snapshot()
+    _INITIAL_TEXT = _encode(_normal(_INITIAL), _PPQ)
+    _INITIAL_ROWS = _decode(_INITIAL_TEXT, _PPQ)
+    _PROTECTED = _others(_INITIAL)
+    _READY = True
+    _log(f"v{VERSION}: 通常マーカー{len(_INITIAL_ROWS)}件 / PPQ={_PPQ}")
+except Exception as error:  # noqa: BLE001 - ホストからの読み取り失敗時は編集を開始しない
+    _log("[起動失敗] " + repr(error))
+    flp.Utils.ShowMessage(
+        "Pattern Marker Transferを開始できませんでした。\n" + repr(error)
+    )
+
+
+if _READY:
+
+    def createDialog():
+        """現在値を1欄に表示し、標準のプレビュー・確定・キャンセルを利用する。"""
+        form = flp.ScriptDialog(
+            SCRIPT_NAME,
+            f"通常マーカー: {len(_INITIAL_ROWS)}件 / PPQ: {_PPQ}\n"
+            "この欄をコピーするか、直接編集・貼り付けしてください。\n"
+            "Previewで確認し、Accept／OKで確定、キャンセルで元に戻します。\n"
+            f"1小節={_BAR_TICKS}tick（基本拍子{_TSNUM}/{_TSDEN}で固定）。\n"
+            "貼り付けオフセットは-16〜+16小節で指定してください。\n"
+            "オフセットは正で後ろへ移動、負で先頭を切り落とします。全件除外は変更なしです。\n"
+            "空欄・不正入力は起動時の状態に戻します。全削除はmarkersを[]にします。",
+        )
+        form.addInputText(DATA, _INITIAL_TEXT)
+        # ホイールの増分が広大な転送範囲に比例しないよう、ノブの操作範囲を絞る。
+        form.addInputKnobInt(OFFSET, 0, -OFFSET_LIMIT, OFFSET_LIMIT)
+        return form
+
+    def apply(form):
+        """全件検査後に適用する。不正・空欄・API失敗では起動時へ復元する。"""
+        try:
+            text = form.getInputValue(DATA)
+            if not isinstance(text, str):
+                raise TypeError("入力値が文字列ではありません。")
+            if not text.strip():
+                _log("空欄のため起動時の状態を採用します。")
+                _restore()
+                return
+            offset_bars = _read_offset(form)
+            source_rows = _decode(text, _PPQ)
+            rows = _plan_placement(source_rows, offset_bars * _BAR_TICKS)
+            if source_rows and not rows:
+                _log(
+                    "[変更なし] 切り落としで全件除外されたため、起動時の状態を採用します。"
+                )
+                _restore()
+                return
+            _replace(rows, _PROTECTED)
+            _log(f"[照合済み] 通常マーカー{len(rows)}件。対象外マーカーを保持。")
+        except Exception as error:  # noqa: BLE001 - 入力途中・ホスト例外をログで報告する
+            _log("[適用中止] " + repr(error))
+            _restore()
