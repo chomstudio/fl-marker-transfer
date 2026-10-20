@@ -1,0 +1,176 @@
+"""パターンマーカー転送のテキスト入出力と置換をFL Studio上で検証する。"""
+
+import json
+import uuid
+
+import flpianoroll as flp
+
+SCRIPT_NAME = "Pattern Marker Transfer - Preflight Check"
+# 入力名で前回値が復元される場合を避ける。ホスト側の復元方式は実機で確認する。
+DATA = "マーカー情報 [" + uuid.uuid4().hex[:8] + "]"
+FIELDS = ("time", "name", "mode", "tsnum", "tsden", "scale_root", "scale_helper")
+
+
+def _log(message):
+    """実機結果をDebugging logへ記録する。"""
+    flp.Utils.log("[PMT Preflight] " + message)
+
+
+def _snapshot():
+    """件数を先に固定し、マーカーの値をPythonオブジェクトへ退避する。"""
+    count = flp.score.markerCount
+    result = []
+    for index in range(count):
+        marker = flp.score.getMarker(index)
+        values = {key: getattr(marker, key) for key in FIELDS[:3]}
+        # 種別によって未対応の追加プロパティがあっても、基本情報の調査は続ける。
+        for key in FIELDS[3:]:
+            try:
+                values[key] = getattr(marker, key)
+            except Exception as error:  # noqa: BLE001 - ホスト側の未対応属性も調査対象
+                _log(f"[INFO] マーカー{index}の{key}は取得不可: {error!r}")
+        result.append(values)
+    return result
+
+
+def _signature(markers):
+    """列挙順の違いを除き、同時刻・同名の重複件数も含めて比較する。"""
+    return sorted(json.dumps(m, ensure_ascii=False, sort_keys=True) for m in markers)
+
+
+def _encode(markers, ppq, mode):
+    """検証用の暫定JSONを生成する。本体の転送形式は別途決定する。"""
+    return json.dumps(
+        {
+            "format": "PMT-preflight-1",
+            "ppq": ppq,
+            "mode": mode,
+            "markers": [
+                {"time": m["time"], "name": m["name"]}
+                for m in markers
+                if m["mode"] == mode
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _decode(text, ppq, mode):
+    """削除前に全データを検査する。異なるPPQの変換は今回扱わない。"""
+    data = json.loads(text)
+    if not isinstance(data, dict) or data.get("format") != "PMT-preflight-1":
+        raise ValueError("検証用データの形式が違います。")
+    if type(data.get("ppq")) is not int or data["ppq"] != ppq:
+        raise ValueError("PPQが異なります。今回は同じPPQで検証してください。")
+    if type(data.get("mode")) is not int or data["mode"] != mode:
+        raise ValueError("コピー元とコピー先で新規Markerのmodeが異なります。")
+    rows = data.get("markers")
+    if not isinstance(rows, list):
+        raise TypeError("markersは配列である必要があります。")
+    result = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise TypeError(f"マーカー{index}がオブジェクトではありません。")
+        time = row.get("time")
+        name = row.get("name")
+        if type(time) is not int or not 0 <= time <= 2147483647:
+            raise ValueError(f"マーカー{index}のtimeが範囲内の非負整数ではありません。")
+        if not isinstance(name, str) or "\x00" in name:
+            raise ValueError(f"マーカー{index}のnameが不正です。")
+        result.append({"time": time, "name": name, "mode": mode})
+    return result
+
+
+def _replace(rows, mode):
+    """追加用オブジェクトをすべて準備してから、指定種別だけを置換する。"""
+    pending = []
+    for row in rows:
+        marker = flp.Marker()
+        marker.mode = mode
+        marker.time = row["time"]
+        marker.name = row["name"]
+        pending.append(marker)
+    before = _snapshot()
+    other_before = [m for m in before if m["mode"] != mode]
+    for index in range(len(before) - 1, -1, -1):
+        if before[index]["mode"] == mode:
+            flp.score.deleteMarker(index)
+    for marker in pending:
+        flp.score.addMarker(marker)
+    after = _snapshot()
+    actual = [{key: m[key] for key in FIELDS[:3]} for m in after if m["mode"] == mode]
+    other_after = [m for m in after if m["mode"] != mode]
+    _log("置換結果=" + json.dumps(after, ensure_ascii=False))
+    _log(
+        "[PASS候補] 名前・位置・件数の一致"
+        if _signature(actual) == _signature(rows)
+        else "[FAIL] 名前・位置・件数が一致しません。"
+    )
+    _log(
+        "[PASS候補] 対象外マーカーを保持"
+        if _signature(other_before) == _signature(other_after)
+        else "[FAIL] 対象外マーカーが変化しました。"
+    )
+    return after
+
+
+_READY = False
+try:
+    _MODE = flp.Marker().mode
+    _PPQ = flp.score.PPQ
+    _INITIAL = _snapshot()
+    _INITIAL_TEXT = _encode(_INITIAL, _PPQ, _MODE)
+    _INITIAL_ROWS = _decode(_INITIAL_TEXT, _PPQ, _MODE)
+    _APPLY_COUNT = 0
+    _log(f"新規Markerの既定mode={_MODE}, PPQ={_PPQ}")
+    _log("起動時マーカー=" + json.dumps(_INITIAL, ensure_ascii=False))
+    _log("入力欄名=" + DATA)
+    _log("起動時データ=" + _INITIAL_TEXT)
+    _READY = True
+except Exception as error:  # noqa: BLE001 - ホストAPIの例外を記録して起動を中止する
+    _log("[FAIL] 起動時の取得: " + repr(error))
+    flp.Utils.ShowMessage("検証スクリプトを開始できませんでした。\n" + repr(error))
+
+
+if _READY:
+
+    def createDialog():
+        """起動時の現在の状態を、コピー・編集・貼り付け兼用の1欄に渡す。"""
+        description = (
+            f"全マーカー: {len(_INITIAL)}件 / 既定mode={_MODE}の候補: "
+            f"{sum(m['mode'] == _MODE for m in _INITIAL)}件 / PPQ: {_PPQ}\n"
+            "この1欄をコピーするか、直接編集・貼り付けしてください。\n"
+            "有効な変更は通常マーカーへ反映します。確定で採用、キャンセルで復元します。\n"
+            "前回値の復元回避を検証するため、欄名の末尾は起動ごとに変わります。"
+        )
+        form = flp.ScriptDialog(SCRIPT_NAME, description)
+        form.addInputText(DATA, _INITIAL_TEXT)
+        return form
+
+    def apply(form):
+        """1欄のデータを検査し、起動時と内容が異なる場合だけ置換する。"""
+        global _APPLY_COUNT
+
+        try:
+            _APPLY_COUNT += 1
+            text = form.getInputValue(DATA)
+            _log(
+                f"文字列取得: apply={_APPLY_COUNT}回目, {len(text)}文字, "
+                f"起動時と一致={text == _INITIAL_TEXT}"
+            )
+            if not text.strip():
+                _log("[SKIP] 空欄です。この入力では置換しません。")
+                return
+            rows = _decode(text, _PPQ, _MODE)
+            _log(f"[PASS候補] デコード成功: {len(rows)}件")
+            if _signature(rows) == _signature(_INITIAL_ROWS):
+                _log("[SKIP] 起動時と同じ内容です。この入力では置換しません。")
+                return
+            _replace(rows, _MODE)
+        except Exception as error:  # noqa: BLE001 - プレビュー中のホスト例外をログで報告する
+            # apply内のモーダル表示は入力変更ごとに繰り返されるため使用しない。
+            _log("[FAIL] " + repr(error))
+            _log(
+                "デコード失敗なら未変更です。置換中の失敗なら直ちにCancelし、復元を確認してください。"
+            )
